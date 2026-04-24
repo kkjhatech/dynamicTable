@@ -10,6 +10,8 @@ A fully dynamic ASP.NET Core Web API where endpoints are configured in a databas
 - **Caching**: In-memory caching of endpoint configuration
 - **Admin Endpoints**: Reload configuration without restarting
 - **Swagger/OpenAPI**: Auto-generated documentation from configuration
+- **JWT Authentication**: Secure token-based authentication with refresh tokens
+- **Role-based Authorization**: Protect endpoints with Admin/User roles
 
 ## Project Structure
 
@@ -19,17 +21,24 @@ DynamicApi/
 ├── Services/
 │   ├── IEndpointConfigService.cs
 │   ├── EndpointConfigService.cs    # Configuration cache management
-│   └── DynamicQueryService.cs      # Dapper SP execution
+│   ├── DynamicQueryService.cs      # Dapper SP execution
+│   ├── IJwtService.cs              # JWT token generation
+│   ├── JwtService.cs
+│   ├── IAuthService.cs             # Authentication logic
+│   └── AuthService.cs
 ├── Models/
 │   ├── ApiEndpointConfig.cs        # Entity model
-│   └── ApiResponse.cs              # Response wrapper
+│   ├── ApiResponse.cs              # Response wrapper
+│   ├── JwtSettings.cs              # JWT configuration
+│   └── AuthModels.cs               # Login/Token models
 ├── Middleware/
 │   └── DynamicRoutingMiddleware.cs # Fallback request handler
 ├── Database/
 │   ├── CreateDatabase.sql          # Database creation
-│   └── Setup.sql                   # Full schema + seed data
+│   ├── Setup.sql                   # Full schema + seed data
+│   └── AuthSetup.sql               # Auth tables setup
 ├── Program.cs                      # App startup + route registration
-├── appsettings.json                # Connection strings
+├── appsettings.json                # Connection strings & JWT config
 └── README.md
 ```
 
@@ -121,6 +130,81 @@ curl -X DELETE http://localhost:5000/api/products/1
 ```bash
 curl -X POST http://localhost:5000/api/reload-config \
   -H "X-Admin-Api-Key: admin-secret-key-12345"
+```
+
+## Authentication
+
+The API uses JWT Bearer tokens for authentication with refresh token support.
+
+### Default Users
+
+| Username | Password | Role  |
+|----------|----------|-------|
+| admin    | admin123 | Admin |
+
+### Login
+
+```bash
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+    "refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...",
+    "tokenType": "Bearer",
+    "expiresIn": 900,
+    "expiresAt": "2024-01-15T10:30:00Z"
+  }
+}
+```
+
+### Use Access Token
+
+Include the token in the Authorization header:
+
+```bash
+curl http://localhost:5000/api/protected-endpoint \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
+```
+
+### Refresh Token
+
+Get a new access token using the refresh token:
+
+```bash
+curl -X POST http://localhost:5000/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."}'
+```
+
+### Logout
+
+Revoke the refresh token:
+
+```bash
+curl -X POST http://localhost:5000/api/auth/logout \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."}'
+```
+
+### Register User (Admin Only)
+
+```bash
+curl -X POST http://localhost:5000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer {admin-token}" \
+  -d '{
+    "username": "newuser",
+    "password": "password123",
+    "email": "newuser@example.com",
+    "role": "User"
+  }'
 ```
 
 ## Adding New Endpoints

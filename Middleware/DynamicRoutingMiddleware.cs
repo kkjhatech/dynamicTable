@@ -1,5 +1,6 @@
 using DyApi.Models;
 using DyApi.Services;
+using System.Security.Claims;
 using System.Text.Json;
 
 namespace DyApi.Middleware;
@@ -15,7 +16,7 @@ public class DynamicRoutingMiddleware
         _logger = logger;
     }
 
-    public async Task InvokeAsync(HttpContext context, IEndpointConfigService configService, IDynamicQueryService queryService)
+    public async Task InvokeAsync(HttpContext context, IEndpointConfigService configService, IDynamicQueryService queryService, IJwtService jwtService)
     {
         var request = context.Request;
         var path = request.Path.Value?.TrimStart('/') ?? "";
@@ -33,6 +34,19 @@ public class DynamicRoutingMiddleware
 
         _logger.LogInformation("Matched dynamic endpoint: {MethodName} ({HttpVerb} {Route})", 
             config.MethodName, config.HttpVerb, config.RouteTemplate);
+
+        // Check authorization if RequiredRole is set
+        if (!string.IsNullOrEmpty(config.RequiredRole))
+        {
+            var authResult = await AuthorizeRequestAsync(context, config.RequiredRole, jwtService);
+            if (!authResult.IsAuthorized)
+            {
+                context.Response.StatusCode = authResult.StatusCode;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(JsonSerializer.Serialize(ApiResponse.ErrorResponse(authResult.ErrorMessage!)));
+                return;
+            }
+        }
 
         try
         {
@@ -68,6 +82,52 @@ public class DynamicRoutingMiddleware
             await context.Response.WriteAsync(JsonSerializer.Serialize(ApiResponse.ErrorResponse(
                 "An error occurred while processing your request.")));
         }
+    }
+
+    private static async Task<AuthResult> AuthorizeRequestAsync(HttpContext context, string requiredRole, IJwtService jwtService)
+    {
+        var authHeader = context.Request.Headers.Authorization.FirstOrDefault();
+        
+        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AuthResult { IsAuthorized = false, StatusCode = StatusCodes.Status401Unauthorized, ErrorMessage = "Authorization header missing or invalid." };
+        }
+
+        var token = authHeader.Substring("Bearer ".Length).Trim();
+        var username = jwtService.ValidateAccessToken(token);
+
+        if (string.IsNullOrEmpty(username))
+        {
+            return new AuthResult { IsAuthorized = false, StatusCode = StatusCodes.Status401Unauthorized, ErrorMessage = "Invalid or expired token." };
+        }
+
+        // Check role
+        if (!string.IsNullOrEmpty(requiredRole))
+        {
+            // Get claims from the authenticated user
+            var user = context.User;
+            if (!user.Identity?.IsAuthenticated ?? true)
+            {
+                return new AuthResult { IsAuthorized = false, StatusCode = StatusCodes.Status401Unauthorized, ErrorMessage = "User not authenticated." };
+            }
+
+            var hasRole = user.IsInRole(requiredRole) || 
+                          user.HasClaim(ClaimTypes.Role, requiredRole);
+
+            if (!hasRole)
+            {
+                return new AuthResult { IsAuthorized = false, StatusCode = StatusCodes.Status403Forbidden, ErrorMessage = $"Required role '{requiredRole}' not found." };
+            }
+        }
+
+        return new AuthResult { IsAuthorized = true };
+    }
+
+    private class AuthResult
+    {
+        public bool IsAuthorized { get; set; }
+        public int StatusCode { get; set; }
+        public string? ErrorMessage { get; set; }
     }
 
     private static async Task<Dictionary<string, object?>> ExtractParametersAsync(HttpContext context, ApiEndpointConfig config)

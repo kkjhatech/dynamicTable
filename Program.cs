@@ -2,7 +2,10 @@ using DyApi.Middleware;
 using DyApi.Models;
 using DyApi.Services;
 using System.Data.SqlClient;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using System.Text;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,7 +14,36 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<IEndpointConfigService, EndpointConfigService>();
 builder.Services.AddScoped<IDynamicQueryService, DynamicQueryService>();
+builder.Services.AddScoped<IJwtService, JwtService>();
+builder.Services.AddScoped<IAuthService, AuthService>();
 
+// Configure JWT Authentication
+var jwtSettings = builder.Configuration.GetSection("Jwt").Get<JwtSettings>();
+if (jwtSettings != null)
+{
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidateAudience = true,
+                ValidateLifetime = true,
+                ValidateIssuerSigningKey = true,
+                ValidIssuer = jwtSettings.Issuer,
+                ValidAudience = jwtSettings.Audience,
+                IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSettings.SecretKey)),
+                ClockSkew = TimeSpan.Zero
+            };
+        });
+}
+
+builder.Services.AddAuthorization(options =>
+{
+    // Add role-based policies
+    options.AddPolicy("Admin", policy => policy.RequireRole("Admin"));
+    options.AddPolicy("User", policy => policy.RequireRole("User", "Admin")); // Admin can also access User endpoints
+});
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 
@@ -25,6 +57,18 @@ builder.Services.AddSwaggerGen(options =>
         Description = "A fully dynamic Web API with configurable endpoints"
     });
 
+    // JWT Bearer Authentication
+    options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header,
+        Name = "Authorization",
+        Description = "JWT Authorization header using the Bearer scheme. Example: \"Bearer {token}\""
+    });
+
+    // API Key Authentication (for admin endpoints)
     options.AddSecurityDefinition("ApiKey", new OpenApiSecurityScheme
     {
         Type = SecuritySchemeType.ApiKey,
@@ -41,7 +85,7 @@ builder.Services.AddSwaggerGen(options =>
                 Reference = new OpenApiReference
                 {
                     Type = ReferenceType.SecurityScheme,
-                    Id = "ApiKey"
+                    Id = "Bearer"
                 }
             },
             Array.Empty<string>()
@@ -69,6 +113,11 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Map authentication endpoints
+MapAuthEndpoints(app);
 
 // Map admin routes before dynamic middleware
 app.MapPost("/api/reload-config", async (HttpContext context, IEndpointConfigService configService, IConfiguration configuration) =>
@@ -138,62 +187,194 @@ app.UseMiddleware<DynamicRoutingMiddleware>();
 
 app.Run();
 
+// Authentication endpoints
+void MapAuthEndpoints(WebApplication app)
+{
+    // Login endpoint
+    app.MapPost("/api/auth/login", async (LoginRequest request, IAuthService authService) =>
+    {
+        if (string.IsNullOrEmpty(request.Username) || string.IsNullOrEmpty(request.Password))
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Username and password are required."));
+        }
+
+        var response = await authService.LoginAsync(request);
+        
+        if (response == null)
+        {
+            return Results.Unauthorized();
+        }
+
+        return Results.Ok(ApiResponse.SuccessResponse(response));
+    })
+    .WithName("Login")
+    .WithOpenApi(operation =>
+    {
+        operation.Summary = "User login";
+        operation.Description = "Authenticate user and receive access token and refresh token.";
+        return operation;
+    });
+
+    // Refresh token endpoint
+    app.MapPost("/api/auth/refresh", async (RefreshTokenRequest request, IJwtService jwtService) =>
+    {
+        if (string.IsNullOrEmpty(request.RefreshToken))
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Refresh token is required."));
+        }
+
+        var response = await jwtService.RefreshTokensAsync(request.RefreshToken);
+        
+        if (response == null)
+        {
+            return Results.Unauthorized();
+        }
+
+        return Results.Ok(ApiResponse.SuccessResponse(response));
+    })
+    .WithName("RefreshToken")
+    .WithOpenApi(operation =>
+    {
+        operation.Summary = "Refresh access token";
+        operation.Description = "Get a new access token using a valid refresh token.";
+        return operation;
+    });
+
+    // Logout endpoint
+    app.MapPost("/api/auth/logout", async (RefreshTokenRequest request, IAuthService authService) =>
+    {
+        if (string.IsNullOrEmpty(request.RefreshToken))
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Refresh token is required."));
+        }
+
+        var success = await authService.LogoutAsync(request.RefreshToken);
+        
+        if (!success)
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Invalid refresh token."));
+        }
+
+        return Results.Ok(ApiResponse.SuccessResponse(new { message = "Logged out successfully." }));
+    })
+    .WithName("Logout")
+    .WithOpenApi(operation =>
+    {
+        operation.Summary = "User logout";
+        operation.Description = "Revoke the refresh token to logout.";
+        return operation;
+    });
+
+    // Register endpoint (admin only)
+    app.MapPost("/api/auth/register", [Microsoft.AspNetCore.Authorization.Authorize(Roles = "Admin")] async (User user, string password, IAuthService authService) =>
+    {
+        if (string.IsNullOrEmpty(user.Username) || string.IsNullOrEmpty(password))
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Username and password are required."));
+        }
+
+        var success = await authService.RegisterAsync(user, password);
+        
+        if (!success)
+        {
+            return Results.BadRequest(ApiResponse.ErrorResponse("Username already exists or registration failed."));
+        }
+
+        return Results.Ok(ApiResponse.SuccessResponse(new { message = "User registered successfully." }));
+    })
+    .WithName("Register")
+    .WithOpenApi(operation =>
+    {
+        operation.Summary = "Register new user (Admin only)";
+        operation.Description = "Create a new user account. Requires Admin role.";
+        return operation;
+    });
+}
+
 // Helper method to register dynamic endpoints
 void RegisterDynamicEndpoint(WebApplication app, ApiEndpointConfig config)
 {
     var routePattern = config.RouteTemplate.TrimStart('/');
     var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
-    logger.LogInformation("Registering dynamic endpoint: {HttpVerb} {Route} -> {StoredProcedure}",
-        config.HttpVerb, config.RouteTemplate, config.StoredProcedureName);
+    logger.LogInformation("Registering dynamic endpoint: {HttpVerb} {Route} -> {StoredProcedure} (Auth: {Auth})",
+        config.HttpVerb, config.RouteTemplate, config.StoredProcedureName,
+        string.IsNullOrEmpty(config.RequiredRole) ? "None" : config.RequiredRole);
 
     try
     {
+        var requireAuth = !string.IsNullOrEmpty(config.RequiredRole);
+
         switch (config.HttpVerb.ToUpperInvariant())
         {
             case "GET":
-                app.MapGet(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
+                var getEndpoint = app.MapGet(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
                 {
                     return await HandleDynamicRequest(context, config, queryService);
                 })
                 .WithName(config.MethodName)
                 .WithOpenApi(operation => BuildOpenApiOperation(operation, config));
+
+                if (requireAuth)
+                    getEndpoint.RequireAuthorization(config.RequiredRole!);
+                else
+                    getEndpoint.AllowAnonymous();
                 break;
 
             case "POST":
-                app.MapPost(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
+                var postEndpoint = app.MapPost(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
                 {
                     return await HandleDynamicRequest(context, config, queryService);
                 })
                 .WithName(config.MethodName)
                 .WithOpenApi(operation => BuildOpenApiOperation(operation, config));
+
+                if (requireAuth)
+                    postEndpoint.RequireAuthorization(config.RequiredRole!);
+                else
+                    postEndpoint.AllowAnonymous();
                 break;
 
             case "PUT":
-                app.MapPut(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
+                var putEndpoint = app.MapPut(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
                 {
                     return await HandleDynamicRequest(context, config, queryService);
                 })
                 .WithName(config.MethodName)
                 .WithOpenApi(operation => BuildOpenApiOperation(operation, config));
+
+                if (requireAuth)
+                    putEndpoint.RequireAuthorization(config.RequiredRole!);
+                else
+                    putEndpoint.AllowAnonymous();
                 break;
 
             case "DELETE":
-                app.MapDelete(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
+                var deleteEndpoint = app.MapDelete(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
                 {
                     return await HandleDynamicRequest(context, config, queryService);
                 })
                 .WithName(config.MethodName)
                 .WithOpenApi(operation => BuildOpenApiOperation(operation, config));
+
+                if (requireAuth)
+                    deleteEndpoint.RequireAuthorization(config.RequiredRole!);
+                else
+                    deleteEndpoint.AllowAnonymous();
                 break;
 
             case "PATCH":
-                app.MapPatch(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
+                var patchEndpoint = app.MapPatch(routePattern, async (HttpContext context, IDynamicQueryService queryService) =>
                 {
                     return await HandleDynamicRequest(context, config, queryService);
                 })
                 .WithName(config.MethodName)
                 .WithOpenApi(operation => BuildOpenApiOperation(operation, config));
+
+                if (requireAuth)
+                    patchEndpoint.RequireAuthorization(config.RequiredRole!);
+                else
+                    patchEndpoint.AllowAnonymous();
                 break;
 
             default:
@@ -322,6 +503,28 @@ OpenApiOperation BuildOpenApiOperation(OpenApiOperation operation, ApiEndpointCo
                 Required = config.RouteTemplate.Contains($"{{{paramName}}}")
             });
         }
+    }
+
+    // Add JWT security requirement if endpoint requires authorization
+    if (!string.IsNullOrEmpty(config.RequiredRole))
+    {
+        operation.Security = new List<OpenApiSecurityRequirement>
+        {
+            new OpenApiSecurityRequirement
+            {
+                {
+                    new OpenApiSecurityScheme
+                    {
+                        Reference = new OpenApiReference
+                        {
+                            Type = ReferenceType.SecurityScheme,
+                            Id = "Bearer"
+                        }
+                    },
+                    Array.Empty<string>()
+                }
+            }
+        };
     }
 
     return operation;

@@ -47,6 +47,54 @@ IF OBJECT_ID('Products', 'U') IS NOT NULL
     DROP TABLE Products;
 GO
 
+IF OBJECT_ID('RefreshTokens', 'U') IS NOT NULL
+    DROP TABLE RefreshTokens;
+GO
+
+IF OBJECT_ID('Users', 'U') IS NOT NULL
+    DROP TABLE Users;
+GO
+
+-- =============================================
+-- Create Authentication Tables
+-- =============================================
+
+CREATE TABLE Users (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    Username NVARCHAR(100) NOT NULL UNIQUE,
+    PasswordHash NVARCHAR(500) NOT NULL,
+    Email NVARCHAR(200) NOT NULL,
+    Role NVARCHAR(50) DEFAULT 'User',
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    IsActive BIT DEFAULT 1
+);
+GO
+
+CREATE INDEX IX_Users_Username ON Users(Username);
+CREATE INDEX IX_Users_Email ON Users(Email);
+GO
+
+CREATE TABLE RefreshTokens (
+    Id INT IDENTITY(1,1) PRIMARY KEY,
+    Token NVARCHAR(500) NOT NULL UNIQUE,
+    Username NVARCHAR(100) NOT NULL,
+    ExpiresAt DATETIME2 NOT NULL,
+    CreatedAt DATETIME2 DEFAULT GETUTCDATE(),
+    IsRevoked BIT DEFAULT 0,
+    RevokedAt DATETIME2 NULL,
+    CONSTRAINT FK_RefreshTokens_Users FOREIGN KEY (Username) REFERENCES Users(Username)
+);
+GO
+
+CREATE INDEX IX_RefreshTokens_Token ON RefreshTokens(Token);
+CREATE INDEX IX_RefreshTokens_Username ON RefreshTokens(Username);
+GO
+
+-- Seed default admin user (password: admin123)
+INSERT INTO Users (Username, PasswordHash, Email, Role, IsActive)
+VALUES ('admin', 'wTmfNTFjS/7b8HR4dK+YLK1kBrT-jArN7lEiI9Gky8Y=', 'admin@dyapi.com', 'Admin', 1);
+GO
+
 -- =============================================
 -- Create Sample Tables
 -- =============================================
